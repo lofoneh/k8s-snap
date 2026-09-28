@@ -101,18 +101,16 @@ HARD_FAILURE_SIGNATURES = [
     r"expected .* but got",
 ]
 
-# `gh run view --log-failed` prefixes lines with "<job>\t<step>\t<timestamp> ";
-# the per-job logs API prefixes lines with just "<timestamp> ". The first line
-# may carry a BOM. Strip either form before matching.
-_LINE_PREFIX = re.compile(
-    r"^(?:[^\t]*\t[^\t]*\t)?\ufeff?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z ?"
-)
+# The per-job logs API prefixes each line with a timestamp, e.g.
+# "2026-09-19T02:05:44.4655607Z ...". The first line may carry a BOM. Strip
+# the prefix before matching against failure signatures.
+_LINE_PREFIX = re.compile(r"^\ufeff?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z ?")
 
-# Matches the timestamp GitHub Actions prepends to every raw log line, e.g.
-# "2026-09-19T02:05:44.4655607Z ...". Used to slice a job log by step, since
-# steps do not otherwise correspond 1:1 with "##[group]" sections (composite
-# actions emit extra groups, and steps after a failure, e.g. artifact
-# uploads, emit groups too).
+# Matches the same timestamp, kept for step boundary lookups (see
+# _step_log_section): steps don't correspond 1:1 with "##[group]" sections
+# (composite actions emit extra groups, and steps after a failure, e.g.
+# artifact uploads, emit groups too), so failed-step sections are sliced out
+# of the raw log by timestamp instead.
 _LINE_TIMESTAMP = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.\d+Z")
 
 
