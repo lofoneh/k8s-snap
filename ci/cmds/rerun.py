@@ -108,8 +108,12 @@ _LINE_PREFIX = re.compile(
     r"^(?:[^\t]*\t[^\t]*\t)?\ufeff?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z ?"
 )
 
-# Marks the beginning of a step's log section within a job log.
-_STEP_GROUP_MARKER = "##[group]Run "
+# Matches the timestamp GitHub Actions prepends to every raw log line, e.g.
+# "2026-09-19T02:05:44.4655607Z ...". Used to slice a job log by step, since
+# steps do not otherwise correspond 1:1 with "##[group]" sections (composite
+# actions emit extra groups, and steps after a failure, e.g. artifact
+# uploads, emit groups too).
+_LINE_TIMESTAMP = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.\d+Z")
 
 
 class RerunError(Exception):
@@ -155,28 +159,53 @@ def _failed_step_sections(repo: str, run_id: int, attempt: int) -> list[str] | N
         if "BlobNotFound" in log[:200]:
             LOG.warning("logs for job %s have expired", job["id"])
             return None
-        sections.extend(_split_step_sections(log, len(failed_steps)))
+        lines = log.splitlines()
+        for step in failed_steps:
+            section = _step_log_section(lines, step)
+            if section:
+                sections.append(section)
     return sections
 
 
-def _split_step_sections(log: str, num_failed_steps: int) -> list[str]:
-    """Split a job log into per-step sections and return the last N.
+def _parse_step_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
-    Steps execute in order, so the failed steps correspond to the last
-    `num_failed_steps` `##[group]Run ` sections of the job log.
+
+def _parse_line_timestamp(line: str) -> datetime | None:
+    m = _LINE_TIMESTAMP.search(line)
+    if not m:
+        return None
+    return datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(
+        tzinfo=timezone.utc
+    )
+
+
+def _step_log_section(lines: list[str], step: dict) -> str:
+    """Return the log lines whose timestamp falls within a step's run time.
+
+    Steps don't correspond 1:1 with a job log's "##[group]Run " sections
+    (composite actions emit extra groups, and steps that run after a
+    failure, e.g. artifact uploads, emit groups of their own), so sections
+    are identified via each step's own started_at/completed_at instead.
+    The step API only has second precision, so up to a second's worth of
+    lines from the immediately adjacent step may bleed in at either
+    boundary; harmless in practice since it's a tiny fraction of a step's
+    log.
     """
-    lines = log.splitlines()
-    groups: list[tuple[int, int]] = []
-    start = None
-    for i, line in enumerate(lines):
-        if _STEP_GROUP_MARKER in line:
-            if start is not None:
-                groups.append((start, i))
-            start = i
-    if start is not None:
-        groups.append((start, len(lines)))
-    tail = groups[-num_failed_steps:] if num_failed_steps else []
-    return ["\n".join(lines[s:e]) for s, e in tail]
+    start = _parse_step_timestamp(step.get("started_at"))
+    end = _parse_step_timestamp(step.get("completed_at")) or datetime.max.replace(
+        tzinfo=timezone.utc
+    )
+    if start is None:
+        return ""
+    matched = [
+        line
+        for line in lines
+        if (ts := _parse_line_timestamp(line)) is not None and start <= ts <= end
+    ]
+    return "\n".join(matched)
 
 
 def _section_is_transient(
