@@ -46,6 +46,10 @@ jobs:
   auto-rerun:
     name: Evaluate and rerun known transient failures
     runs-on: ubuntu-latest
+    # Serialize evaluations so the daily rerun budget check (read count, then
+    # decide) can't race across concurrent invocations.
+    concurrency:
+      group: auto-rerun-flaky
     # Only react to failed runs (workflow_dispatch provides its own run ID).
     if: >-
       github.event_name == 'workflow_dispatch' ||
