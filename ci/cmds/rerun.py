@@ -44,6 +44,12 @@ DEFAULT_MAX_DAILY_RERUNS = 20
 # enforce the daily rerun budget.
 AUTO_RERUN_WORKFLOW_FILE = "auto-rerun-flaky.yaml"
 
+# Logged only at the point where a rerun is actually triggered (see
+# cmd_auto_rerun). Used to identify, from a past auto-rerun workflow run's
+# logs, whether it actually triggered a rerun as opposed to evaluating and
+# skipping (e.g. not a known flake, budget exhausted, dry-run).
+RERUN_TRIGGERED_MARKER = "rerun triggered for "
+
 # Known transient infrastructure failure signatures (regular expressions).
 #
 # A failed run is only rerun automatically if every failed step's log section
@@ -129,6 +135,18 @@ def _gh_api_json(endpoint: str) -> dict:
     return json.loads(_gh(["api", endpoint]).stdout)
 
 
+def _gh_api_paginated_list(endpoint: str, jq_filter: str) -> list[dict]:
+    """Call `gh api --paginate` and return every matched item across all pages.
+
+    `jq_filter` is applied per-page (e.g. `.jobs[]`) so that endpoints whose
+    JSON body wraps the collection in an object (rather than being a bare
+    top-level array) still get fully paginated instead of only returning the
+    first page.
+    """
+    proc = _gh(["api", "--paginate", endpoint, "--jq", jq_filter])
+    return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+
+
 def _strip_prefix(line: str) -> str:
     return _LINE_PREFIX.sub("", line)
 
@@ -139,9 +157,12 @@ def _failed_step_sections(repo: str, run_id: int, attempt: int) -> list[str] | N
     Returns None if any failed job's logs are unavailable (e.g. expired),
     in which case the caller must not rerun.
     """
-    jobs = _gh_api_json(
-        f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100"
-    )["jobs"]
+    # This endpoint is capped at 100 results per page; paginate through all of
+    # them, since fan-out test workflows routinely have more than 100 jobs.
+    jobs = _gh_api_paginated_list(
+        f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+        ".jobs[]",
+    )
     sections: list[str] = []
     for job in jobs:
         if job["conclusion"] != "failure":
@@ -223,13 +244,44 @@ def _section_is_transient(
     return True
 
 
-def _count_reruns_today(repo: str) -> int:
-    """Count how many times the auto-rerun workflow has run today (UTC).
+def _run_actually_triggered_rerun(repo: str, run_id: int) -> bool | None:
+    """Return whether a past auto-rerun workflow run actually triggered a rerun.
 
-    The auto-rerun workflow runs at most once per completed target workflow
-    run and triggers at most one rerun per invocation, so the number of its
-    own runs today is a conservative upper bound on the number of automatic
-    reruns triggered today.
+    Returns None if this can't be determined (e.g. its jobs or logs are
+    unavailable), so the caller can fail closed instead of under-counting.
+    """
+    try:
+        jobs = _gh_api_json(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")[
+            "jobs"
+        ]
+    except subprocess.CalledProcessError as e:
+        LOG.warning("could not list jobs for auto-rerun run %s: %s", run_id, e.stderr)
+        return None
+    for job in jobs:
+        try:
+            log = _gh(["api", f"repos/{repo}/actions/jobs/{job['id']}/logs"]).stdout
+        except subprocess.CalledProcessError as e:
+            LOG.warning(
+                "could not fetch logs for auto-rerun job %s: %s", job["id"], e.stderr
+            )
+            return None
+        if RERUN_TRIGGERED_MARKER in log:
+            return True
+    return False
+
+
+def _count_reruns_today(repo: str, max_daily: int) -> int | None:
+    """Count how many automatic reruns have actually been triggered today (UTC).
+
+    Only counts auto-rerun workflow invocations that actually called
+    `gh run rerun` (identified via RERUN_TRIGGERED_MARKER in their logs), not
+    every invocation of the workflow -- most invocations evaluate a failure
+    and decide *not* to rerun (not a known flake, per-run attempt cap, dry-run,
+    manual workflow_dispatch, ...) and must not count against the budget.
+
+    Returns None if the count can't be reliably determined, so the caller can
+    fail closed (treat the budget as exhausted) instead of risking exceeding
+    it on a transient API error.
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
@@ -244,17 +296,32 @@ def _count_reruns_today(repo: str) -> int:
                 "--created",
                 f">={today}",
                 "--json",
-                "databaseId",
+                "databaseId,status,event",
                 "--limit",
                 "200",
             ]
         )
-    except subprocess.CalledProcessError:
-        # The auto-rerun workflow does not exist yet (e.g. first ever run);
-        # treat as zero reruns so far today.
-        LOG.debug("could not list auto-rerun workflow runs; assuming 0 today")
-        return 0
-    return len(json.loads(proc.stdout or "[]"))
+    except subprocess.CalledProcessError as e:
+        LOG.warning("could not list auto-rerun workflow runs: %s", e.stderr)
+        return None
+    runs = json.loads(proc.stdout or "[]")
+    count = 0
+    for r in runs:
+        if count >= max_daily:
+            # Budget already exhausted; no need to keep paying for more log
+            # fetches to get an exact count.
+            break
+        # Manual workflow_dispatch invocations are not automatic reruns.
+        if r.get("event") == "workflow_dispatch":
+            continue
+        if r.get("status") != "completed":
+            continue
+        triggered = _run_actually_triggered_rerun(repo, r["databaseId"])
+        if triggered is None:
+            return None
+        if triggered:
+            count += 1
+    return count
 
 
 def cmd_auto_rerun(args: argparse.Namespace) -> int:
@@ -285,7 +352,13 @@ def cmd_auto_rerun(args: argparse.Namespace) -> int:
         )
         return 0
 
-    reruns_today = _count_reruns_today(repo)
+    reruns_today = _count_reruns_today(repo, args.max_daily)
+    if reruns_today is None:
+        LOG.info(
+            "could not determine today's auto-rerun count; failing closed, "
+            "not rerunning"
+        )
+        return 0
     if reruns_today >= args.max_daily:
         LOG.info(
             "daily auto-rerun budget exhausted (%d >= %d); not rerunning",
@@ -312,7 +385,7 @@ def cmd_auto_rerun(args: argparse.Namespace) -> int:
 
     LOG.info("all failed steps match known transient signatures; rerunning")
     _gh(["run", "rerun", str(run_id), "--repo", repo, "--failed"])
-    LOG.info("rerun triggered for %s", run_url)
+    LOG.info("%s%s", RERUN_TRIGGERED_MARKER, run_url)
     return 0
 
 

@@ -9,8 +9,9 @@ name: Auto-rerun flaky failures
 #   * only runs that concluded as 'failure' are considered
 #   * at most 2 automatic reruns per workflow run (run_attempt < 3)
 #   * at most MAX_DAILY_AUTO_RERUNS automatic reruns per UTC day
-#   * every line of every failed job's log must match a known transient
-#     signature -- a single unmatched line means no rerun
+#   * every failed step's log section must contain at least one known
+#     transient signature AND no hard test-failure indicator (e.g.
+#     AssertionError) -- otherwise no rerun
 #
 # This workflow intentionally only implements the rerun *action*. Detection,
 # classification and reporting of flaky failures are handled separately.
